@@ -15,8 +15,8 @@ using System;
 using System.Runtime.InteropServices;
 
 public static class NativeKeyboard {
-    [DllImport("user32.dll")]
-    public static extern void keybd_event(byte virtualKey, byte scanCode, int flags, UIntPtr extraInfo);
+  [DllImport("user32.dll")]
+  public static extern void keybd_event(byte virtualKey, byte scanCode, int flags, UIntPtr extraInfo);
 }
 "@;
 
@@ -27,16 +27,24 @@ $KEYEVENTF_KEYUP = 0x2
 $VK_LWIN = 0x5B
 $VK_TAB = 0x09
 
-[NativeKeyboard]::keybd_event($VK_LWIN, 0, $KEYEVENTF_EXTENDEDKEY, [UIntPtr]::Zero)
-[NativeKeyboard]::keybd_event($VK_TAB, 0, 0, [UIntPtr]::Zero)
-[NativeKeyboard]::keybd_event($VK_TAB, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
-[NativeKeyboard]::keybd_event($VK_LWIN, 0, $KEYEVENTF_EXTENDEDKEY -bor $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+while ($true) {
+  $line = [Console]::In.ReadLine();
+  if ($null -eq $line) { Start-Sleep -Milliseconds 5; continue }
+  if ($line -eq 'TRIGGER') {
+    [NativeKeyboard]::keybd_event($VK_LWIN, 0, $KEYEVENTF_EXTENDEDKEY, [UIntPtr]::Zero)
+    [NativeKeyboard]::keybd_event($VK_TAB, 0, 0, [UIntPtr]::Zero)
+    [NativeKeyboard]::keybd_event($VK_TAB, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+    [NativeKeyboard]::keybd_event($VK_LWIN, 0, $KEYEVENTF_EXTENDEDKEY -bor $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+  } elseif ($line -eq 'EXIT') {
+    break
+  }
+}
 `;
 
 const ENCODED_POWERSHELL_SCRIPT = Buffer.from(POWERSHELL_SCRIPT, 'utf16le').toString('base64');
 
 const SPEED_PRESETS = {
-  instant: { label: 'Instant', interval: 0, cooldown: 350 },
+  instant: { label: 'Instant', interval: 0, cooldown: 0 },
   'very-fast': { label: 'Very fast', interval: 25, cooldown: 650 },
   fast: { label: 'Fast', interval: 55, cooldown: 900 },
   medium: { label: 'Medium', interval: 130, cooldown: 1400 },
@@ -129,17 +137,26 @@ async function applyStoredRunOnStartupSetting() {
 
 function triggerTaskView() {
   try {
+    if (psWorker && psWorker.stdin && !psWorker.killed) {
+      try {
+        psWorker.stdin.write('TRIGGER\n');
+        return;
+      } catch (err) {
+        console.error('Failed to write to PowerShell worker stdin, falling back to spawn:', err);
+      }
+    }
+
     const child = spawn(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', ENCODED_POWERSHELL_SCRIPT],
       { windowsHide: true }
     );
     child.on('error', (error) => {
-  console.error('Failed to start PowerShell for Win+Tab:', error);
+      console.error('Failed to start PowerShell for Win+Tab:', error);
     });
     child.on('close', (code) => {
       if (code !== 0) {
-  console.error(`PowerShell Win+Tab exited with code ${code}`);
+        console.error(`PowerShell Win+Tab exited with code ${code}`);
       }
     });
   } catch (error) {
@@ -190,6 +207,45 @@ let tray = null;
 let pollTimer = null;
 let lastTriggerTs = 0;
 let cornerEngaged = false;
+let psWorker = null;
+
+function startPowerShellWorker() {
+  if (psWorker) return;
+  try {
+    psWorker = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', ENCODED_POWERSHELL_SCRIPT],
+      { windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] }
+    );
+
+    psWorker.on('error', (err) => {
+      console.error('PowerShell worker error:', err);
+      psWorker = null;
+    });
+
+    psWorker.on('exit', (code, signal) => {
+      console.warn('PowerShell worker exited:', code, signal);
+      psWorker = null;
+      setTimeout(() => {
+        if (!app.isQuitting && !psWorker) startPowerShellWorker();
+      }, 250);
+    });
+  } catch (error) {
+    console.error('Failed to start PowerShell worker:', error);
+    psWorker = null;
+  }
+}
+
+function stopPowerShellWorker() {
+  if (!psWorker) return;
+  try {
+    psWorker.stdin && psWorker.stdin.write('EXIT\n');
+  } catch (e) {}
+  try {
+    psWorker.kill();
+  } catch (e) {}
+  psWorker = null;
+}
 
 function createTrayIcon() {
   const iconPath = path.join(__dirname, '..', TRAY_ICON_FILENAME);
@@ -455,11 +511,13 @@ app.whenReady().then(async () => {
   await applyStoredRunOnStartupSetting();
   initializeTray();
   setupDisplayListeners();
+  startPowerShellWorker();
   startPolling();
 });
 
 app.on('before-quit', () => {
   stopPolling();
+  stopPowerShellWorker();
 });
 
 app.on('window-all-closed', (event) => {

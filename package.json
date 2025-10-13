@@ -1,6 +1,6 @@
 {
   "name": "corner-taskview",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Windows tray helper that triggers Task View (Win+Tab) when the cursor hits a configurable screen corner.",
   "main": "src/main.js",
   "author": "Olivier Dutoit.",
