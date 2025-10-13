@@ -177,9 +177,12 @@ async function ensureStore() {
       displayId: 'primary',
       corner: 'top-left',
       detectionSpeed: 'fast',
-      runOnStartup: false
+      runOnStartup: false,
+      disableOnFullscreen: true,
+      excludedPrograms: []
     }
   });
+
 
   return store;
 }
@@ -208,6 +211,8 @@ let pollTimer = null;
 let lastTriggerTs = 0;
 let cornerEngaged = false;
 let psWorker = null;
+let suppressionActive = false;
+let foregroundMonitorTimer = null;
 
 function startPowerShellWorker() {
   if (psWorker) return;
@@ -298,6 +303,10 @@ function getCurrentCooldown() {
 }
 
 function attemptTrigger(point) {
+  if (suppressionActive) {
+    // suppressed due to fullscreen or excluded app
+    return;
+  }
   const display = getTargetDisplay();
   const bounds = display.bounds;
 
@@ -327,6 +336,111 @@ function attemptTrigger(point) {
   lastTriggerTs = now;
   cornerEngaged = true;
   triggerTaskView();
+}
+
+function queryForegroundInfo() {
+  return new Promise((resolve) => {
+    const psScript = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+[StructLayout(LayoutKind.Sequential)] public struct RECT { public int left; public int top; public int right; public int bottom; }
+[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Auto)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+[StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT { public int length; public int flags; public int showCmd; public POINT ptMinPosition; public POINT ptMaxPosition; public RECT rcNormalPosition; }
+public class WinAPI {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr", SetLastError=true)] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+    [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+}
+"@;
+
+$hwnd = [WinAPI]::GetForegroundWindow()
+if ($hwnd -eq 0) { Write-Output "{}"; exit }
+[WinAPI]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+$mi = New-Object MONITORINFO
+$mi.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([MONITORINFO])
+[WinAPI]::GetMonitorInfo([WinAPI]::MonitorFromWindow($hwnd, 2), [ref]$mi) | Out-Null
+[WinAPI]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
+$proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+$path = $proc.Path -replace "\\","\\\\"
+$title = ''
+try { $len = [WinAPI]::GetWindowTextLength($hwnd); if ($len -gt 0) { $sb = New-Object System.Text.StringBuilder $len; [WinAPI]::GetWindowText($hwnd, $sb, $sb.Capacity+1) | Out-Null; $title = $sb.ToString() } } catch {}
+$winWidth = $r.right - $r.left
+$winHeight = $r.bottom - $r.top
+$monWidth = $mi.rcMonitor.right - $mi.rcMonitor.left
+$monHeight = $mi.rcMonitor.bottom - $mi.rcMonitor.top
+$isFs = ($winWidth -ge $monWidth -and $winHeight -ge $monHeight)
+# check window styles to distinguish maximized/borderless windows from true fullscreen popup windows
+$GWL_STYLE = -16
+$WS_CAPTION = 0x00C00000
+$WS_POPUP = 0x80000000
+$WS_OVERLAPPEDWINDOW = 0x00CF0000
+$WS_THICKFRAME = 0x00040000
+$stylePtr = [WinAPI]::GetWindowLongPtr($hwnd, $GWL_STYLE)
+$style = 0
+try { $style = [int64]$stylePtr } catch { $style = 0 }
+$hasCaption = ($style -band $WS_CAPTION) -ne 0
+$hasPopup = ($style -band $WS_POPUP) -ne 0
+$hasThickFrame = ($style -band $WS_THICKFRAME) -ne 0
+$isOverlappedWindow = ($style -band $WS_OVERLAPPEDWINDOW) -eq $WS_OVERLAPPEDWINDOW
+$placement = New-Object WINDOWPLACEMENT
+$placement.length = [System.Runtime.InteropServices.Marshal]::SizeOf([WINDOWPLACEMENT])
+$isMaximized = $false
+if ([WinAPI]::GetWindowPlacement($hwnd, [ref]$placement)) {
+  $isMaximized = ($placement.showCmd -eq 3)
+}
+$isBorderless = (-not $hasCaption) -and (-not $hasThickFrame)
+# Consider 'real fullscreen' when window covers monitor AND is borderless/popup or not an overlapped maximized window
+$isRealFs = $isFs -and (($isBorderless -or $hasPopup -or -not $isOverlappedWindow) -and -not $isMaximized)
+@{ exe = $path; title = $title; isFullscreen = $isFs; isRealFullscreen = $isRealFs; isMaximized = $isMaximized; isBorderless = $isBorderless } | ConvertTo-Json -Compress
+`;
+
+    const child = spawn('powershell.exe', ['-NoProfile','-NonInteractive','-WindowStyle','Hidden','-Command', psScript], { windowsHide: true });
+    let out = '';
+    child.stdout && child.stdout.on('data', (d) => out += d.toString());
+    child.on('error', () => resolve({}));
+    child.on('close', () => {
+      try {
+        const parsed = JSON.parse(out || '{}');
+        resolve(parsed);
+      } catch (e) {
+        resolve({});
+      }
+    });
+  });
+}
+
+function startForegroundMonitor() {
+  stopForegroundMonitor();
+  const interval = 250;
+  foregroundMonitorTimer = setInterval(async () => {
+    try {
+      const info = await queryForegroundInfo();
+      const disables = store?.get('disableOnFullscreen', true);
+      const excluded = store?.get('excludedPrograms', []) || [];
+      const exe = (info.exe || '').toLowerCase();
+      const basename = exe ? path.basename(exe).toLowerCase() : '';
+      const isExcluded = excluded.some((e) => String(e).toLowerCase() === exe || String(e).toLowerCase() === basename);
+      const isRealFs = !!info.isRealFullscreen;
+      suppressionActive = (disables && isRealFs) || isExcluded;
+    } catch (e) {
+    }
+  }, interval);
+}
+
+function stopForegroundMonitor() {
+  if (foregroundMonitorTimer) {
+    clearInterval(foregroundMonitorTimer);
+    foregroundMonitorTimer = null;
+  }
 }
 
 function startPolling() {
@@ -447,6 +561,65 @@ function rebuildMenu() {
     { label: 'Target display', submenu: buildDisplayMenu() },
     { label: 'Detection speed', submenu: buildSpeedMenu() },
     {
+      label: 'Disable when full-screen',
+      type: 'checkbox',
+      checked: !!store?.get('disableOnFullscreen', true),
+      click: (menuItem) => {
+        if (store) {
+          store.set('disableOnFullscreen', !!menuItem.checked);
+          // restart monitor so suppressionActive recalculates immediately
+          startForegroundMonitor();
+          rebuildMenu();
+        }
+      }
+    },
+    {
+      label: 'Excluded programs',
+      submenu: (function () {
+        const items = [];
+        const excluded = store?.get('excludedPrograms', []) || [];
+        items.push({
+          label: 'Add focused app to exclusions',
+          click: async () => {
+            const info = await queryForegroundInfo();
+            const exe = info.exe || '';
+            if (exe && store) {
+              const list = store.get('excludedPrograms', []) || [];
+              if (!list.includes(exe)) {
+                list.push(exe);
+                store.set('excludedPrograms', list);
+              }
+              rebuildMenu();
+            }
+          }
+        });
+        if (excluded.length === 0) {
+          items.push({ label: 'No excluded programs', enabled: false });
+        } else {
+          excluded.forEach((exe, idx) => {
+            items.push({
+              label: `${path.basename(String(exe))} — ${exe}`,
+              click: () => {
+                const list = store.get('excludedPrograms', []) || [];
+                list.splice(idx, 1);
+                store.set('excludedPrograms', list);
+                rebuildMenu();
+              }
+            });
+          });
+          items.push({ type: 'separator' });
+          items.push({
+            label: 'Clear excluded programs',
+            click: () => {
+              store.set('excludedPrograms', []);
+              rebuildMenu();
+            }
+          });
+        }
+        return items;
+      })()
+    },
+    {
       label: 'Run on Windows startup',
       type: 'checkbox',
       checked: store?.get('runOnStartup', false) && hasStartupShortcut(),
@@ -512,12 +685,14 @@ app.whenReady().then(async () => {
   initializeTray();
   setupDisplayListeners();
   startPowerShellWorker();
+  startForegroundMonitor();
   startPolling();
 });
 
 app.on('before-quit', () => {
   stopPolling();
   stopPowerShellWorker();
+  stopForegroundMonitor();
 });
 
 app.on('window-all-closed', (event) => {
