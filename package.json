@@ -1,0 +1,51 @@
+{
+  "name": "corner-taskview",
+  "version": "0.1.0",
+  "description": "Windows tray helper that triggers Task View (Win+Tab) when the cursor hits a configurable screen corner.",
+  "main": "src/main.js",
+  "author": "Olivier Dutoit.",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "electron-store": "^9.0.0"
+  },
+  "devDependencies": {
+    "electron": "^31.3.0",
+    "electron-builder": "^25.0.5"
+  },
+  "build": {
+    "appId": "com.cornertaskview.helper",
+    "productName": "Corner TaskView",
+    "files": [
+      "src/**/*",
+      "logo.png",
+      "logo-tray.png",
+      "package.json"
+    ],
+    "directories": {
+      "buildResources": "build"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "msi",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Corner TaskView-${version}-${arch}.${ext}",
+      "icon": "logo.png"
+    }
+  }
+}
