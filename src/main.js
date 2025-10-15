@@ -213,6 +213,8 @@ let cornerEngaged = false;
 let psWorker = null;
 let suppressionActive = false;
 let foregroundMonitorTimer = null;
+let lastForegroundInfo = null;
+let lastTaskViewTriggerTs = 0;
 
 function startPowerShellWorker() {
   if (psWorker) return;
@@ -303,8 +305,12 @@ function getCurrentCooldown() {
 }
 
 function attemptTrigger(point) {
-  if (suppressionActive) {
-    // suppressed due to fullscreen or excluded app
+  const activeTaskView = isTaskViewLike(lastForegroundInfo);
+  if (activeTaskView) {
+    cornerEngaged = false;
+  }
+  if (suppressionActive && !activeTaskView) {
+    cornerEngaged = false;
     return;
   }
   const display = getTargetDisplay();
@@ -324,12 +330,18 @@ function attemptTrigger(point) {
     return;
   }
 
-  if (cornerEngaged) {
+  if (cornerEngaged && !activeTaskView) {
     return;
   }
 
   const now = Date.now();
-  if (now - lastTriggerTs < getCurrentCooldown()) {
+  const cooldown = getCurrentCooldown();
+  if (activeTaskView) {
+    const enforced = Math.max(cooldown, 250);
+    if (now - lastTriggerTs < enforced) {
+      return;
+    }
+  } else if (now - lastTriggerTs < cooldown) {
     return;
   }
 
@@ -350,15 +362,16 @@ using System.Text;
 [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
 [StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT { public int length; public int flags; public int showCmd; public POINT ptMinPosition; public POINT ptMaxPosition; public RECT rcNormalPosition; }
 public class WinAPI {
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr", SetLastError=true)] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
-    [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
-    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
-    [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
-    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
-    [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr", SetLastError=true)] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+  [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+  [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+  [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+  [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 }
 "@;
 
@@ -370,9 +383,18 @@ $mi.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([MONITORINFO])
 [WinAPI]::GetMonitorInfo([WinAPI]::MonitorFromWindow($hwnd, 2), [ref]$mi) | Out-Null
 [WinAPI]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
 $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
-$path = $proc.Path -replace "\\","\\\\"
+$procPath = ''
+$procName = ''
+if ($proc) {
+  $procPath = $proc.Path
+  $procName = $proc.ProcessName
+}
+$path = $procPath -replace "\\","\\\\"
+        lastTaskViewTriggerTs = Date.now();
 $title = ''
 try { $len = [WinAPI]::GetWindowTextLength($hwnd); if ($len -gt 0) { $sb = New-Object System.Text.StringBuilder $len; [WinAPI]::GetWindowText($hwnd, $sb, $sb.Capacity+1) | Out-Null; $title = $sb.ToString() } } catch {}
+$className = ''
+try { $sbClass = New-Object System.Text.StringBuilder 256; $lenClass = [WinAPI]::GetClassName($hwnd, $sbClass, $sbClass.Capacity); if ($lenClass -gt 0) { $className = $sbClass.ToString() } } catch {}
 $winWidth = $r.right - $r.left
 $winHeight = $r.bottom - $r.top
 $monWidth = $mi.rcMonitor.right - $mi.rcMonitor.left
@@ -381,6 +403,7 @@ $isFs = ($winWidth -ge $monWidth -and $winHeight -ge $monHeight)
 # check window styles to distinguish maximized/borderless windows from true fullscreen popup windows
 $GWL_STYLE = -16
 $WS_CAPTION = 0x00C00000
+    lastTaskViewTriggerTs = Date.now();
 $WS_POPUP = 0x80000000
 $WS_OVERLAPPEDWINDOW = 0x00CF0000
 $WS_THICKFRAME = 0x00040000
@@ -400,7 +423,13 @@ if ([WinAPI]::GetWindowPlacement($hwnd, [ref]$placement)) {
 $isBorderless = (-not $hasCaption) -and (-not $hasThickFrame)
 # Consider 'real fullscreen' when window covers monitor AND is borderless/popup or not an overlapped maximized window
 $isRealFs = $isFs -and (($isBorderless -or $hasPopup -or -not $isOverlappedWindow) -and -not $isMaximized)
-@{ exe = $path; title = $title; isFullscreen = $isFs; isRealFullscreen = $isRealFs; isMaximized = $isMaximized; isBorderless = $isBorderless } | ConvertTo-Json -Compress
+$isTaskView = $false
+if ($isFs -and ($procName -eq 'explorer' -or $procPath -like '*ShellExperienceHost*')) {
+  if ($title -match 'Task View') { $isTaskView = $true }
+  elseif ($className -match 'TaskView|Multitasking|TaskSwitcher|XamlExplorer|Windows.UI.Core.CoreWindow') { $isTaskView = $true }
+}
+if (-not $isTaskView -and $className -match 'TaskSwitcherWnd') { $isTaskView = $true }
+@{ exe = $path; title = $title; className = $className; procName = $procName; isFullscreen = $isFs; isRealFullscreen = $isRealFs; isMaximized = $isMaximized; isBorderless = $isBorderless; isTaskView = $isTaskView } | ConvertTo-Json -Compress
 `;
 
     const child = spawn('powershell.exe', ['-NoProfile','-NonInteractive','-WindowStyle','Hidden','-Command', psScript], { windowsHide: true });
@@ -418,20 +447,66 @@ $isRealFs = $isFs -and (($isBorderless -or $hasPopup -or -not $isOverlappedWindo
   });
 }
 
+function isTaskViewLike(info) {
+  if (!info) {
+    return false;
+  }
+
+  if (info.isTaskView) {
+    return true;
+  }
+
+  const now = Date.now();
+  const exe = (info.exe || '').toLowerCase();
+  const proc = (info.procName || '').toLowerCase();
+  const cls = (info.className || '').toLowerCase();
+  const title = (info.title || '').toLowerCase();
+  const isRealFs = !!info.isRealFullscreen;
+
+  const triggeredRecently = now - lastTaskViewTriggerTs < 5000;
+  const isShellProcess = proc === 'explorer' || proc.includes('shellexperience') || exe.endsWith('explorer.exe') || exe.includes('shellexperiencehost');
+
+  if (isRealFs && isShellProcess && triggeredRecently) {
+    return true;
+  }
+
+  if (isRealFs && isShellProcess) {
+    if (cls.includes('task') || cls.includes('multitasking') || cls.includes('taskswitch') || cls.includes('xamlexplorer') || cls.includes('corewindow')) {
+      return true;
+    }
+  }
+
+  if (cls.includes('taskswitcherwnd')) {
+    return true;
+  }
+
+  if (title && /task|vue|tâche|aufgaben|attività|aktivit/i.test(title)) {
+    return true;
+  }
+
+  return false;
+}
+
 function startForegroundMonitor() {
   stopForegroundMonitor();
   const interval = 250;
   foregroundMonitorTimer = setInterval(async () => {
     try {
       const info = await queryForegroundInfo();
+      lastForegroundInfo = info && typeof info === 'object' ? info : null;
       const disables = store?.get('disableOnFullscreen', true);
       const excluded = store?.get('excludedPrograms', []) || [];
-      const exe = (info.exe || '').toLowerCase();
+      const exe = (info?.exe || '').toLowerCase();
       const basename = exe ? path.basename(exe).toLowerCase() : '';
-      const isExcluded = excluded.some((e) => String(e).toLowerCase() === exe || String(e).toLowerCase() === basename);
-      const isRealFs = !!info.isRealFullscreen;
-      suppressionActive = (disables && isRealFs) || isExcluded;
+      const isExcluded = excluded.some((e) => {
+        const lower = String(e).toLowerCase();
+        return lower === exe || lower === basename;
+      });
+      const isTaskView = isTaskViewLike(info);
+      const isRealFs = !!info?.isRealFullscreen;
+      suppressionActive = (disables && isRealFs && !isTaskView) || isExcluded;
     } catch (e) {
+      lastForegroundInfo = null;
     }
   }, interval);
 }
@@ -441,6 +516,8 @@ function stopForegroundMonitor() {
     clearInterval(foregroundMonitorTimer);
     foregroundMonitorTimer = null;
   }
+  lastForegroundInfo = null;
+  suppressionActive = false;
 }
 
 function startPolling() {
