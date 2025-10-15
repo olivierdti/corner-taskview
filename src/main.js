@@ -6,7 +6,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 let store = null;
 
-const EDGE_THRESHOLD_PX = 30;
+const EDGE_THRESHOLD_PX = 12;
 const APP_ICON_FILENAME = 'logo.png';
 const TRAY_ICON_FILENAME = 'logo-tray.png';
 const POWERSHELL_SCRIPT = `
