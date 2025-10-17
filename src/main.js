@@ -4,9 +4,10 @@ const fs = require('fs');
 const { app, Tray, Menu, nativeImage, screen, shell } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
+const readline = require('readline');
 let store = null;
 
-const EDGE_THRESHOLD_PX = 12;
+const EDGE_THRESHOLD_PX = 30;
 const APP_ICON_FILENAME = 'logo.png';
 const TRAY_ICON_FILENAME = 'logo-tray.png';
 const POWERSHELL_SCRIPT = `
@@ -41,7 +42,107 @@ while ($true) {
 }
 `;
 
+const FOREGROUND_POWERSHELL_SCRIPT = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+[StructLayout(LayoutKind.Sequential)] public struct RECT { public int left; public int top; public int right; public int bottom; }
+[StructLayout(LayoutKind.Sequential)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+[StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT { public int length; public int flags; public int showCmd; public POINT ptMinPosition; public POINT ptMaxPosition; public RECT rcNormalPosition; }
+public class WinAPI {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr", SetLastError=true)] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+    [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+}
+"@;
+
+$ProgressPreference = 'SilentlyContinue'
+
+function Get-ForegroundInfo {
+  $hwnd = [WinAPI]::GetForegroundWindow()
+  if ($hwnd -eq 0) { return '{}' }
+  [WinAPI]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+  $mi = New-Object MONITORINFO
+  $mi.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([MONITORINFO])
+  [WinAPI]::GetMonitorInfo([WinAPI]::MonitorFromWindow($hwnd, 2), [ref]$mi) | Out-Null
+  [WinAPI]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
+  $proc = $null
+  try { $proc = Get-Process -Id $pid -ErrorAction Stop } catch {}
+  $path = ''
+  if ($proc -ne $null) {
+    try { $path = $proc.Path -replace "\\","\\\\" } catch {}
+  }
+  $title = ''
+  try {
+    $len = [WinAPI]::GetWindowTextLength($hwnd)
+    if ($len -gt 0) {
+      $sb = New-Object System.Text.StringBuilder $len
+      [WinAPI]::GetWindowText($hwnd, $sb, $sb.Capacity + 1) | Out-Null
+      $title = $sb.ToString()
+    }
+  } catch {}
+  $winWidth = $r.right - $r.left
+  $winHeight = $r.bottom - $r.top
+  $monWidth = $mi.rcMonitor.right - $mi.rcMonitor.left
+  $monHeight = $mi.rcMonitor.bottom - $mi.rcMonitor.top
+  $isFs = ($winWidth -ge $monWidth -and $winHeight -ge $monHeight)
+  $GWL_STYLE = -16
+  $WS_CAPTION = 0x00C00000
+  $WS_POPUP = 0x80000000
+  $WS_OVERLAPPEDWINDOW = 0x00CF0000
+  $WS_THICKFRAME = 0x00040000
+  $stylePtr = [WinAPI]::GetWindowLongPtr($hwnd, $GWL_STYLE)
+  $style = 0
+  try { $style = [int64]$stylePtr } catch { $style = 0 }
+  $hasCaption = ($style -band $WS_CAPTION) -ne 0
+  $hasPopup = ($style -band $WS_POPUP) -ne 0
+  $hasThickFrame = ($style -band $WS_THICKFRAME) -ne 0
+  $isOverlappedWindow = ($style -band $WS_OVERLAPPEDWINDOW) -eq $WS_OVERLAPPEDWINDOW
+  $placement = New-Object WINDOWPLACEMENT
+  $placement.length = [System.Runtime.InteropServices.Marshal]::SizeOf([WINDOWPLACEMENT])
+  $isMaximized = $false
+  if ([WinAPI]::GetWindowPlacement($hwnd, [ref]$placement)) {
+    $isMaximized = ($placement.showCmd -eq 3)
+  }
+  $isBorderless = (-not $hasCaption) -and (-not $hasThickFrame)
+  $isRealFs = $isFs -and (($isBorderless -or $hasPopup -or -not $isOverlappedWindow) -and -not $isMaximized)
+  @{ exe = $path; title = $title; isFullscreen = $isFs; isRealFullscreen = $isRealFs; isMaximized = $isMaximized; isBorderless = $isBorderless } | ConvertTo-Json -Compress
+}
+
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($null -eq $line) { Start-Sleep -Milliseconds 10; continue }
+  if ($line -eq 'STATUS') {
+    try {
+      $json = Get-ForegroundInfo
+      [Console]::Out.WriteLine($json)
+      [Console]::Out.Flush()
+    } catch {
+      [Console]::Out.WriteLine('{}')
+      [Console]::Out.Flush()
+    }
+  } elseif ($line -eq 'EXIT') {
+    break
+  }
+}
+`;
+
 const ENCODED_POWERSHELL_SCRIPT = Buffer.from(POWERSHELL_SCRIPT, 'utf16le').toString('base64');
+const ENCODED_FOREGROUND_SCRIPT = Buffer.from(FOREGROUND_POWERSHELL_SCRIPT, 'utf16le').toString('base64');
+
+const FOREGROUND_POLL_INTERVAL = 650;
+const FOREGROUND_REFRESH_INTERVAL = 350;
+const NEAR_CORNER_THRESHOLD_PX = EDGE_THRESHOLD_PX * 2;
+const MIN_DYNAMIC_POLL_DELAY = 8;
+const IDLE_POLL_MAX_DELAY = 450;
 
 const SPEED_PRESETS = {
   instant: { label: 'Instant', interval: 0, cooldown: 0 },
@@ -208,13 +309,22 @@ const CORNERS = {
 
 let tray = null;
 let pollTimer = null;
+let pollActive = false;
+let lastCursorPoint = null;
+let cursorIdleStreak = 0;
 let lastTriggerTs = 0;
 let cornerEngaged = false;
 let psWorker = null;
 let suppressionActive = false;
 let foregroundMonitorTimer = null;
+let foregroundWorker = null;
+let foregroundWorkerRl = null;
+let foregroundWorkerQueue = [];
+let foregroundInfoPromise = null;
 let lastForegroundInfo = null;
-let lastTaskViewTriggerTs = 0;
+let lastForegroundInfoTs = 0;
+let lastForegroundRefreshTs = 0;
+let shuttingDown = false;
 
 function startPowerShellWorker() {
   if (psWorker) return;
@@ -234,7 +344,7 @@ function startPowerShellWorker() {
       console.warn('PowerShell worker exited:', code, signal);
       psWorker = null;
       setTimeout(() => {
-        if (!app.isQuitting && !psWorker) startPowerShellWorker();
+        if (!shuttingDown && !psWorker) startPowerShellWorker();
       }, 250);
     });
   } catch (error) {
@@ -252,6 +362,242 @@ function stopPowerShellWorker() {
     psWorker.kill();
   } catch (e) {}
   psWorker = null;
+}
+
+function shouldMonitorForeground() {
+  const disables = store?.get('disableOnFullscreen', true);
+  const excluded = store?.get('excludedPrograms', []) || [];
+  return !!disables || excluded.length > 0;
+}
+
+function drainForegroundWorkerQueue() {
+  if (!foregroundWorkerQueue.length) {
+    return;
+  }
+  const pending = foregroundWorkerQueue.slice();
+  foregroundWorkerQueue.length = 0;
+  pending.forEach((entry) => {
+    clearTimeout(entry.timeout);
+    try {
+      entry.done('{}');
+    } catch (err) {
+      // ignore
+    }
+  });
+}
+
+function startForegroundWorker() {
+  if (foregroundWorker) {
+    return;
+  }
+
+  try {
+    foregroundWorker = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', ENCODED_FOREGROUND_SCRIPT],
+      { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+  } catch (error) {
+    console.error('Failed to start foreground PowerShell worker:', error);
+    foregroundWorker = null;
+    return;
+  }
+
+  foregroundWorkerQueue = [];
+  foregroundWorkerRl = readline.createInterface({ input: foregroundWorker.stdout });
+  foregroundWorkerRl.on('line', (line) => {
+    const entry = foregroundWorkerQueue.shift();
+    if (!entry) {
+      return;
+    }
+    clearTimeout(entry.timeout);
+    try {
+      entry.done((line || '').trim() || '{}');
+    } catch (err) {
+      entry.done('{}');
+    }
+  });
+
+  const scheduleRestart = () => {
+    drainForegroundWorkerQueue();
+    if (foregroundWorkerRl) {
+      foregroundWorkerRl.removeAllListeners();
+      foregroundWorkerRl.close();
+      foregroundWorkerRl = null;
+    }
+    foregroundWorker = null;
+    if (!shuttingDown && shouldMonitorForeground()) {
+      setTimeout(() => {
+        if (!foregroundWorker) {
+          startForegroundWorker();
+        }
+      }, 500);
+    }
+  };
+
+  foregroundWorker.on('error', (err) => {
+    console.error('Foreground worker error:', err);
+    scheduleRestart();
+  });
+
+  foregroundWorker.on('exit', (code, signal) => {
+    if (code !== 0) {
+      console.warn('Foreground worker exited:', code, signal);
+    }
+    scheduleRestart();
+  });
+}
+
+function stopForegroundWorker() {
+  if (!foregroundWorker) {
+    return;
+  }
+
+  const worker = foregroundWorker;
+  foregroundWorker = null;
+
+  try {
+    worker.removeAllListeners('error');
+    worker.removeAllListeners('exit');
+  } catch (e) {}
+
+  if (foregroundWorkerRl) {
+    foregroundWorkerRl.removeAllListeners();
+    foregroundWorkerRl.close();
+    foregroundWorkerRl = null;
+  }
+
+  try {
+    worker.stdin?.write('EXIT\n');
+  } catch (e) {}
+
+  try {
+    worker.stdin?.end();
+  } catch (e) {}
+
+  try {
+    worker.kill();
+  } catch (e) {}
+
+  drainForegroundWorkerQueue();
+}
+
+function removeForegroundQueueEntry(entry) {
+  const idx = foregroundWorkerQueue.indexOf(entry);
+  if (idx >= 0) {
+    foregroundWorkerQueue.splice(idx, 1);
+  }
+}
+
+function requestForegroundInfoDirect() {
+  startForegroundWorker();
+  if (!foregroundWorker) {
+    return Promise.resolve({});
+  }
+
+  return new Promise((resolve) => {
+    const queueEntry = {
+      done: (line) => {
+        try {
+          const parsed = JSON.parse(line || '{}');
+          resolve(parsed);
+        } catch (err) {
+          resolve({});
+        }
+      },
+      timeout: null
+    };
+
+    queueEntry.timeout = setTimeout(() => {
+      removeForegroundQueueEntry(queueEntry);
+      resolve({});
+    }, 1500);
+
+    foregroundWorkerQueue.push(queueEntry);
+
+    try {
+      foregroundWorker.stdin.write('STATUS\n', (err) => {
+        if (!err) {
+          return;
+        }
+        clearTimeout(queueEntry.timeout);
+        removeForegroundQueueEntry(queueEntry);
+        resolve({});
+      });
+    } catch (error) {
+      clearTimeout(queueEntry.timeout);
+      removeForegroundQueueEntry(queueEntry);
+      console.error('Failed to query foreground worker:', error);
+      resolve({});
+      stopForegroundWorker();
+    }
+  }).then((info) => {
+    if (info && typeof info === 'object') {
+      lastForegroundInfo = info;
+      lastForegroundInfoTs = Date.now();
+    }
+    return info;
+  });
+}
+
+function fetchForegroundInfo(force = false) {
+  if (!force && lastForegroundInfo && Date.now() - lastForegroundInfoTs < FOREGROUND_REFRESH_INTERVAL) {
+    return Promise.resolve(lastForegroundInfo);
+  }
+
+  if (foregroundInfoPromise) {
+    return foregroundInfoPromise;
+  }
+
+  foregroundInfoPromise = requestForegroundInfoDirect()
+    .catch((error) => {
+      console.error('Unable to read foreground info:', error);
+      return {};
+    })
+    .finally(() => {
+      foregroundInfoPromise = null;
+    });
+
+  return foregroundInfoPromise.then((info) => info || {});
+}
+
+function updateSuppressionFromInfo(info) {
+  const disables = store?.get('disableOnFullscreen', true);
+  const excluded = store?.get('excludedPrograms', []) || [];
+  const exe = (info?.exe || '').toLowerCase();
+  const basename = exe ? path.basename(exe).toLowerCase() : '';
+  const isExcluded = excluded.some((entry) => {
+    const normalized = String(entry || '').toLowerCase();
+    return normalized === exe || normalized === basename;
+  });
+  const isRealFs = !!info?.isRealFullscreen;
+  suppressionActive = (disables && isRealFs) || isExcluded;
+}
+
+function refreshForegroundInfoIfStale(force = false) {
+  if (!shouldMonitorForeground()) {
+    suppressionActive = false;
+    return;
+  }
+
+  const now = Date.now();
+  if (!force && now - lastForegroundRefreshTs < FOREGROUND_REFRESH_INTERVAL) {
+    return;
+  }
+
+  lastForegroundRefreshTs = now;
+
+  fetchForegroundInfo(force)
+    .then((info) => {
+      if (shouldMonitorForeground()) {
+        updateSuppressionFromInfo(info);
+      } else {
+        suppressionActive = false;
+      }
+    })
+    .catch(() => {
+      suppressionActive = false;
+    });
 }
 
 function createTrayIcon() {
@@ -289,6 +635,28 @@ function pointInDisplayBounds(point, bounds) {
   return point.x >= bounds.x && point.x <= bounds.x + bounds.width && point.y >= bounds.y && point.y <= bounds.y + bounds.height;
 }
 
+function getCornerCoordinates(bounds, cornerKey) {
+  switch (cornerKey) {
+    case 'top-left':
+      return { x: bounds.x, y: bounds.y };
+    case 'top-right':
+      return { x: bounds.x + bounds.width, y: bounds.y };
+    case 'bottom-left':
+      return { x: bounds.x, y: bounds.y + bounds.height };
+    case 'bottom-right':
+      return { x: bounds.x + bounds.width, y: bounds.y + bounds.height };
+    default:
+      return { x: bounds.x, y: bounds.y };
+  }
+}
+
+function isPointNearCorner(point, bounds, thresholdPx = NEAR_CORNER_THRESHOLD_PX) {
+  const cornerKey = getActiveCornerKey();
+  const target = getCornerCoordinates(bounds, cornerKey);
+  const threshold = Math.max(EDGE_THRESHOLD_PX, thresholdPx);
+  return Math.abs(point.x - target.x) <= threshold && Math.abs(point.y - target.y) <= threshold;
+}
+
 function getActiveSpeedKey() {
   const storedSpeed = store?.get('detectionSpeed', 'fast') ?? 'fast';
   return SPEED_PRESETS[storedSpeed] ? storedSpeed : 'fast';
@@ -305,12 +673,8 @@ function getCurrentCooldown() {
 }
 
 function attemptTrigger(point) {
-  const activeTaskView = isTaskViewLike(lastForegroundInfo);
-  if (activeTaskView) {
-    cornerEngaged = false;
-  }
-  if (suppressionActive && !activeTaskView) {
-    cornerEngaged = false;
+  if (suppressionActive) {
+    // suppressed due to fullscreen or excluded app
     return;
   }
   const display = getTargetDisplay();
@@ -330,18 +694,12 @@ function attemptTrigger(point) {
     return;
   }
 
-  if (cornerEngaged && !activeTaskView) {
+  if (cornerEngaged) {
     return;
   }
 
   const now = Date.now();
-  const cooldown = getCurrentCooldown();
-  if (activeTaskView) {
-    const enforced = Math.max(cooldown, 250);
-    if (now - lastTriggerTs < enforced) {
-      return;
-    }
-  } else if (now - lastTriggerTs < cooldown) {
+  if (now - lastTriggerTs < getCurrentCooldown()) {
     return;
   }
 
@@ -350,165 +708,23 @@ function attemptTrigger(point) {
   triggerTaskView();
 }
 
-function queryForegroundInfo() {
-  return new Promise((resolve) => {
-    const psScript = `
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-[StructLayout(LayoutKind.Sequential)] public struct RECT { public int left; public int top; public int right; public int bottom; }
-[StructLayout(LayoutKind.Sequential, CharSet=CharSet.Auto)] public struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
-[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
-[StructLayout(LayoutKind.Sequential)] public struct WINDOWPLACEMENT { public int length; public int flags; public int showCmd; public POINT ptMinPosition; public POINT ptMaxPosition; public RECT rcNormalPosition; }
-public class WinAPI {
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-  [DllImport("user32.dll", EntryPoint = "GetWindowLongPtr", SetLastError=true)] public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
-  [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
-  [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
-  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
-  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
-  [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
-  [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-}
-"@;
-
-$hwnd = [WinAPI]::GetForegroundWindow()
-if ($hwnd -eq 0) { Write-Output "{}"; exit }
-[WinAPI]::GetWindowRect($hwnd, [ref]$r) | Out-Null
-$mi = New-Object MONITORINFO
-$mi.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf([MONITORINFO])
-[WinAPI]::GetMonitorInfo([WinAPI]::MonitorFromWindow($hwnd, 2), [ref]$mi) | Out-Null
-[WinAPI]::GetWindowThreadProcessId($hwnd, [ref]$pid) | Out-Null
-$proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
-$procPath = ''
-$procName = ''
-if ($proc) {
-  $procPath = $proc.Path
-  $procName = $proc.ProcessName
-}
-$path = $procPath -replace "\\","\\\\"
-        lastTaskViewTriggerTs = Date.now();
-$title = ''
-try { $len = [WinAPI]::GetWindowTextLength($hwnd); if ($len -gt 0) { $sb = New-Object System.Text.StringBuilder $len; [WinAPI]::GetWindowText($hwnd, $sb, $sb.Capacity+1) | Out-Null; $title = $sb.ToString() } } catch {}
-$className = ''
-try { $sbClass = New-Object System.Text.StringBuilder 256; $lenClass = [WinAPI]::GetClassName($hwnd, $sbClass, $sbClass.Capacity); if ($lenClass -gt 0) { $className = $sbClass.ToString() } } catch {}
-$winWidth = $r.right - $r.left
-$winHeight = $r.bottom - $r.top
-$monWidth = $mi.rcMonitor.right - $mi.rcMonitor.left
-$monHeight = $mi.rcMonitor.bottom - $mi.rcMonitor.top
-$isFs = ($winWidth -ge $monWidth -and $winHeight -ge $monHeight)
-# check window styles to distinguish maximized/borderless windows from true fullscreen popup windows
-$GWL_STYLE = -16
-$WS_CAPTION = 0x00C00000
-    lastTaskViewTriggerTs = Date.now();
-$WS_POPUP = 0x80000000
-$WS_OVERLAPPEDWINDOW = 0x00CF0000
-$WS_THICKFRAME = 0x00040000
-$stylePtr = [WinAPI]::GetWindowLongPtr($hwnd, $GWL_STYLE)
-$style = 0
-try { $style = [int64]$stylePtr } catch { $style = 0 }
-$hasCaption = ($style -band $WS_CAPTION) -ne 0
-$hasPopup = ($style -band $WS_POPUP) -ne 0
-$hasThickFrame = ($style -band $WS_THICKFRAME) -ne 0
-$isOverlappedWindow = ($style -band $WS_OVERLAPPEDWINDOW) -eq $WS_OVERLAPPEDWINDOW
-$placement = New-Object WINDOWPLACEMENT
-$placement.length = [System.Runtime.InteropServices.Marshal]::SizeOf([WINDOWPLACEMENT])
-$isMaximized = $false
-if ([WinAPI]::GetWindowPlacement($hwnd, [ref]$placement)) {
-  $isMaximized = ($placement.showCmd -eq 3)
-}
-$isBorderless = (-not $hasCaption) -and (-not $hasThickFrame)
-# Consider 'real fullscreen' when window covers monitor AND is borderless/popup or not an overlapped maximized window
-$isRealFs = $isFs -and (($isBorderless -or $hasPopup -or -not $isOverlappedWindow) -and -not $isMaximized)
-$isTaskView = $false
-if ($isFs -and ($procName -eq 'explorer' -or $procPath -like '*ShellExperienceHost*')) {
-  if ($title -match 'Task View') { $isTaskView = $true }
-  elseif ($className -match 'TaskView|Multitasking|TaskSwitcher|XamlExplorer|Windows.UI.Core.CoreWindow') { $isTaskView = $true }
-}
-if (-not $isTaskView -and $className -match 'TaskSwitcherWnd') { $isTaskView = $true }
-@{ exe = $path; title = $title; className = $className; procName = $procName; isFullscreen = $isFs; isRealFullscreen = $isRealFs; isMaximized = $isMaximized; isBorderless = $isBorderless; isTaskView = $isTaskView } | ConvertTo-Json -Compress
-`;
-
-    const child = spawn('powershell.exe', ['-NoProfile','-NonInteractive','-WindowStyle','Hidden','-Command', psScript], { windowsHide: true });
-    let out = '';
-    child.stdout && child.stdout.on('data', (d) => out += d.toString());
-    child.on('error', () => resolve({}));
-    child.on('close', () => {
-      try {
-        const parsed = JSON.parse(out || '{}');
-        resolve(parsed);
-      } catch (e) {
-        resolve({});
-      }
-    });
-  });
-}
-
-function isTaskViewLike(info) {
-  if (!info) {
-    return false;
+async function queryForegroundInfo(force = false) {
+  const info = await fetchForegroundInfo(force);
+  if (!shouldMonitorForeground()) {
+    stopForegroundWorker();
   }
-
-  if (info.isTaskView) {
-    return true;
-  }
-
-  const now = Date.now();
-  const exe = (info.exe || '').toLowerCase();
-  const proc = (info.procName || '').toLowerCase();
-  const cls = (info.className || '').toLowerCase();
-  const title = (info.title || '').toLowerCase();
-  const isRealFs = !!info.isRealFullscreen;
-
-  const triggeredRecently = now - lastTaskViewTriggerTs < 5000;
-  const isShellProcess = proc === 'explorer' || proc.includes('shellexperience') || exe.endsWith('explorer.exe') || exe.includes('shellexperiencehost');
-
-  if (isRealFs && isShellProcess && triggeredRecently) {
-    return true;
-  }
-
-  if (isRealFs && isShellProcess) {
-    if (cls.includes('task') || cls.includes('multitasking') || cls.includes('taskswitch') || cls.includes('xamlexplorer') || cls.includes('corewindow')) {
-      return true;
-    }
-  }
-
-  if (cls.includes('taskswitcherwnd')) {
-    return true;
-  }
-
-  if (title && /task|vue|tâche|aufgaben|attività|aktivit/i.test(title)) {
-    return true;
-  }
-
-  return false;
+  return info || {};
 }
 
 function startForegroundMonitor() {
-  stopForegroundMonitor();
-  const interval = 250;
-  foregroundMonitorTimer = setInterval(async () => {
-    try {
-      const info = await queryForegroundInfo();
-      lastForegroundInfo = info && typeof info === 'object' ? info : null;
-      const disables = store?.get('disableOnFullscreen', true);
-      const excluded = store?.get('excludedPrograms', []) || [];
-      const exe = (info?.exe || '').toLowerCase();
-      const basename = exe ? path.basename(exe).toLowerCase() : '';
-      const isExcluded = excluded.some((e) => {
-        const lower = String(e).toLowerCase();
-        return lower === exe || lower === basename;
-      });
-      const isTaskView = isTaskViewLike(info);
-      const isRealFs = !!info?.isRealFullscreen;
-      suppressionActive = (disables && isRealFs && !isTaskView) || isExcluded;
-    } catch (e) {
-      lastForegroundInfo = null;
-    }
-  }, interval);
+  if (foregroundMonitorTimer) {
+    return;
+  }
+
+  startForegroundWorker();
+  foregroundMonitorTimer = setInterval(() => {
+    refreshForegroundInfoIfStale(true);
+  }, FOREGROUND_POLL_INTERVAL);
 }
 
 function stopForegroundMonitor() {
@@ -516,41 +732,88 @@ function stopForegroundMonitor() {
     clearInterval(foregroundMonitorTimer);
     foregroundMonitorTimer = null;
   }
-  lastForegroundInfo = null;
-  suppressionActive = false;
+  stopForegroundWorker();
+}
+
+function refreshForegroundMonitorState() {
+  if (shouldMonitorForeground()) {
+    startForegroundMonitor();
+    refreshForegroundInfoIfStale(true);
+  } else {
+    stopForegroundMonitor();
+    suppressionActive = false;
+  }
+}
+
+function scheduleNextPoll(delay) {
+  if (!pollActive) {
+    return;
+  }
+  const normalizedDelay = Math.max(0, delay);
+  const cappedDelay = Math.min(IDLE_POLL_MAX_DELAY, Math.max(MIN_DYNAMIC_POLL_DELAY, normalizedDelay));
+  pollTimer = setTimeout(runCursorPoll, cappedDelay);
+}
+
+function runCursorPoll() {
+  if (!pollActive) {
+    return;
+  }
+
+  const point = screen.getCursorScreenPoint();
+  const display = getTargetDisplay();
+  const bounds = display.bounds;
+  const nearCorner = isPointNearCorner(point, bounds, NEAR_CORNER_THRESHOLD_PX);
+
+  if (nearCorner && shouldMonitorForeground()) {
+    refreshForegroundInfoIfStale(false);
+  }
+
+  attemptTrigger(point);
+
+  const moved = !lastCursorPoint || point.x !== lastCursorPoint.x || point.y !== lastCursorPoint.y;
+  lastCursorPoint = point;
+
+  const baseInterval = getCurrentPollInterval();
+  let nextDelay;
+
+  if (baseInterval <= 0) {
+    if (moved) {
+      cursorIdleStreak = 0;
+      nextDelay = MIN_DYNAMIC_POLL_DELAY;
+    } else {
+      cursorIdleStreak = Math.min(cursorIdleStreak + 1, 10);
+      nextDelay = Math.min(IDLE_POLL_MAX_DELAY, MIN_DYNAMIC_POLL_DELAY + cursorIdleStreak * 15);
+    }
+  } else {
+    if (moved) {
+      cursorIdleStreak = 0;
+      nextDelay = Math.max(MIN_DYNAMIC_POLL_DELAY, baseInterval);
+    } else {
+      cursorIdleStreak = Math.min(cursorIdleStreak + 1, 8);
+      nextDelay = Math.min(IDLE_POLL_MAX_DELAY, baseInterval + cursorIdleStreak * 40);
+    }
+  }
+
+  if (nearCorner) {
+    const aggressiveDelay = baseInterval > 0 ? Math.max(MIN_DYNAMIC_POLL_DELAY, Math.floor(baseInterval / 2)) : MIN_DYNAMIC_POLL_DELAY;
+    nextDelay = Math.min(nextDelay, aggressiveDelay);
+  }
+
+  scheduleNextPoll(nextDelay);
 }
 
 function startPolling() {
   stopPolling();
-  const interval = getCurrentPollInterval();
-  if (interval <= 0) {
-    const loopState = { type: 'immediate', active: true };
-    const runLoop = () => {
-      if (!loopState.active) {
-        return;
-      }
-      const cursorPoint = screen.getCursorScreenPoint();
-      attemptTrigger(cursorPoint);
-      setImmediate(runLoop);
-    };
-    pollTimer = loopState;
-    setImmediate(runLoop);
-    return;
-  }
-
-  pollTimer = setInterval(() => {
-    const cursorPoint = screen.getCursorScreenPoint();
-    attemptTrigger(cursorPoint);
-  }, interval);
+  pollActive = true;
+  cursorIdleStreak = 0;
+  lastCursorPoint = null;
+  runCursorPoll();
 }
 
 function stopPolling() {
+  pollActive = false;
   if (pollTimer) {
-    if (pollTimer.type === 'immediate') {
-      pollTimer.active = false;
-    } else {
-      clearInterval(pollTimer);
-    }
+    clearTimeout(pollTimer);
     pollTimer = null;
   }
 }
@@ -644,8 +907,8 @@ function rebuildMenu() {
       click: (menuItem) => {
         if (store) {
           store.set('disableOnFullscreen', !!menuItem.checked);
-          // restart monitor so suppressionActive recalculates immediately
-          startForegroundMonitor();
+          // refresh monitor so suppression state recalculates immediately
+          refreshForegroundMonitorState();
           rebuildMenu();
         }
       }
@@ -658,7 +921,7 @@ function rebuildMenu() {
         items.push({
           label: 'Add focused app to exclusions',
           click: async () => {
-            const info = await queryForegroundInfo();
+            const info = await queryForegroundInfo(true);
             const exe = info.exe || '';
             if (exe && store) {
               const list = store.get('excludedPrograms', []) || [];
@@ -666,6 +929,7 @@ function rebuildMenu() {
                 list.push(exe);
                 store.set('excludedPrograms', list);
               }
+              refreshForegroundMonitorState();
               rebuildMenu();
             }
           }
@@ -680,6 +944,7 @@ function rebuildMenu() {
                 const list = store.get('excludedPrograms', []) || [];
                 list.splice(idx, 1);
                 store.set('excludedPrograms', list);
+                refreshForegroundMonitorState();
                 rebuildMenu();
               }
             });
@@ -689,6 +954,7 @@ function rebuildMenu() {
             label: 'Clear excluded programs',
             click: () => {
               store.set('excludedPrograms', []);
+              refreshForegroundMonitorState();
               rebuildMenu();
             }
           });
@@ -711,7 +977,11 @@ function rebuildMenu() {
     {
       label: 'Quit',
       click: () => {
+        shuttingDown = true;
+        app.isQuitting = true;
         stopPolling();
+        stopForegroundMonitor();
+        stopPowerShellWorker();
         app.quit();
       }
     }
@@ -762,11 +1032,13 @@ app.whenReady().then(async () => {
   initializeTray();
   setupDisplayListeners();
   startPowerShellWorker();
-  startForegroundMonitor();
+  refreshForegroundMonitorState();
   startPolling();
 });
 
 app.on('before-quit', () => {
+  shuttingDown = true;
+  app.isQuitting = true;
   stopPolling();
   stopPowerShellWorker();
   stopForegroundMonitor();
